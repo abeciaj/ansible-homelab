@@ -1,0 +1,164 @@
+---
+# Homelab bootstrap playbook
+# Run against: Dell OptiPlex 7070 Micro x3, Debian 12
+#
+# Usage:
+#   ansible-playbook site.yml
+#
+# Covers:
+#   1. Base update/upgrade + common tools
+#   2. /etc/hosts static name resolution (homelab-scale "DNS")
+#   3. fail2ban
+#   4. k3s (server on node1, agents on node2/node3)
+
+# ---------------------------------------------------------------------------
+# Play 1: runs on ALL nodes
+# ---------------------------------------------------------------------------
+- name: Base system setup (all nodes)
+  hosts: k3s_cluster
+  become: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Full upgrade
+      ansible.builtin.apt:
+        upgrade: dist
+
+    - name: Install common tools
+      ansible.builtin.apt:
+        name:
+          - curl
+          - wget
+          - vim
+          - git
+          - htop
+          - net-tools
+          - openssh-server
+          - ufw
+          - fail2ban
+        state: present
+
+    - name: Disable swap now
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+      changed_when: true
+
+    - name: Remove swap entries from /etc/fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        line: '#\1'
+        backrefs: true
+
+    - name: Deploy /etc/hosts with all cluster nodes
+      ansible.builtin.template:
+        src: templates/hosts.j2
+        dest: /etc/hosts
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Configure fail2ban jail for sshd
+      ansible.builtin.template:
+        src: templates/jail.local.j2
+        dest: /etc/fail2ban/jail.local
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart fail2ban
+
+    - name: Ensure fail2ban is enabled and running
+      ansible.builtin.systemd:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    - name: Allow SSH through ufw
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: Enable ufw
+      community.general.ufw:
+        state: enabled
+        policy: deny
+
+  handlers:
+    - name: Restart fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: restarted
+
+# ---------------------------------------------------------------------------
+# Play 2: k3s server (control-plane) — node1 only
+# ---------------------------------------------------------------------------
+- name: Install k3s server
+  hosts: k3s_server
+  become: true
+  tasks:
+    - name: Check if k3s is already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_installed
+
+    - name: Download and run k3s install script (server)
+      ansible.builtin.shell: curl -sfL https://get.k3s.io | sh -
+      when: not k3s_installed.stat.exists
+      changed_when: not k3s_installed.stat.exists
+
+    - name: Wait for node-token file to exist
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/k3s/server/node-token
+        timeout: 60
+
+    - name: Read node token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: node_token_raw
+
+    - name: Store node token as a fact for agents to use
+      ansible.builtin.set_fact:
+        k3s_node_token: "{{ node_token_raw.content | b64decode | trim }}"
+
+# ---------------------------------------------------------------------------
+# Play 3: k3s agents (workers) — node2, node3
+# ---------------------------------------------------------------------------
+- name: Install k3s agents
+  hosts: k3s_agents
+  become: true
+  vars:
+    k3s_server_ip: "{{ hostvars[groups['k3s_server'][0]].ansible_host }}"
+    k3s_token: "{{ hostvars[groups['k3s_server'][0]].k3s_node_token }}"
+  tasks:
+    - name: Check if k3s agent is already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_agent_installed
+
+    - name: Download and run k3s install script (agent)
+      ansible.builtin.shell: >
+        curl -sfL https://get.k3s.io |
+        K3S_URL=https://{{ k3s_server_ip }}:6443
+        K3S_TOKEN={{ k3s_token }}
+        sh -
+      when: not k3s_agent_installed.stat.exists
+      changed_when: not k3s_agent_installed.stat.exists
+
+# ---------------------------------------------------------------------------
+# Play 4: sanity check from the control-plane
+# ---------------------------------------------------------------------------
+- name: Verify cluster
+  hosts: k3s_server
+  become: true
+  tasks:
+    - name: Get node status
+      ansible.builtin.command: k3s kubectl get nodes -o wide
+      register: node_status
+      changed_when: false
+
+    - name: Show cluster nodes
+      ansible.builtin.debug:
+        msg: "{{ node_status.stdout_lines }}"

@@ -1,0 +1,14 @@
+---
+# Shared variables used across all playbooks/roles.
+
+# Used to build /etc/hosts entries on every node so they can resolve
+# each other by name instead of IP.
+cluster_hosts:
+  - { ip: "192.168.1.101", name: "node1" }
+  - { ip: "192.168.1.102", name: "node2" }
+  - { ip: "192.168.1.103", name: "node3" }
+
+# fail2ban settings
+fail2ban_maxretry: 5
+fail2ban_bantime: 3600
+fail2ban_findtime: 600
