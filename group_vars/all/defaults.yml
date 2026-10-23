@@ -1,0 +1,33 @@
+---
+# Shared variables used across all playbooks/roles.
+#
+# Committed defaults. Put your real values in group_vars/all/local.yml
+# (git-ignored); it loads after this file, so anything set there wins.
+
+# Used to build /etc/hosts entries on every node so they can resolve
+# each other by name instead of IP. Must match inventory.ini.
+cluster_hosts:
+  - { ip: "192.168.1.101", name: "node1" }
+  - { ip: "192.168.1.102", name: "node2" }
+  - { ip: "192.168.1.103", name: "node3" }
+
+# Subnet the 3 nodes live on. k3s ports (6443, 8472, 10250) are only
+# opened in ufw for traffic coming from this range.
+lan_subnet: "192.168.1.0/24"
+
+# SSH is only allowed from this range. Defaults to the LAN; widen it if you
+# manage the nodes from another subnet (e.g. a VPN), or you'll be locked out.
+ssh_allowed_cidr: "{{ lan_subnet }}"
+
+# k3s release installed on every node. Bump this and re-run the playbook to
+# upgrade (server first, then agents). Releases: https://github.com/k3s-io/k3s/releases
+k3s_version: "v1.36.5+k3s1"
+
+# k3s defaults; only change these if you pass custom CIDRs to k3s.
+k3s_pod_cidr: "10.42.0.0/16"
+k3s_service_cidr: "10.43.0.0/16"
+
+# fail2ban settings
+fail2ban_maxretry: 5
+fail2ban_bantime: 3600
+fail2ban_findtime: 600
