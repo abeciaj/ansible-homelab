@@ -13,3 +13,7 @@ k3s.yaml
 
 # Editor
 .vscode/
+
+# Local environment (real IPs, usernames). Copy from the committed examples.
+inventory.ini
+group_vars/all/local.yml
