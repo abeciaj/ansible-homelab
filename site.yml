@@ -1,6 +1,6 @@
 ---
 # Homelab bootstrap playbook
-# Run against: Dell OptiPlex 7070 Micro x3, Debian 12
+# Run against: Dell OptiPlex 7070 Micro x3, Debian 13
 #
 # Usage:
 #   ansible-playbook site.yml
@@ -8,7 +8,7 @@
 # Covers:
 #   1. Base update/upgrade + common tools
 #   2. /etc/hosts static name resolution (homelab-scale "DNS")
-#   3. fail2ban
+#   3. fail2ban + ufw (SSH and k3s cluster traffic allowed)
 #   4. k3s (server on node1, agents on node2/node3)
 
 # ---------------------------------------------------------------------------
@@ -80,6 +80,27 @@
       community.general.ufw:
         rule: allow
         name: OpenSSH
+
+    # k3s needs these open between the nodes, otherwise agents can't join
+    # and pod networking breaks. Must be in place before ufw is enabled.
+    - name: Allow k3s node-to-node traffic from the LAN
+      community.general.ufw:
+        rule: allow
+        src: "{{ lan_subnet }}"
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+      loop:
+        - { port: "6443", proto: tcp }    # Kubernetes API server
+        - { port: "8472", proto: udp }    # Flannel VXLAN
+        - { port: "10250", proto: tcp }   # Kubelet
+
+    - name: Allow k3s pod and service networks
+      community.general.ufw:
+        rule: allow
+        src: "{{ item }}"
+      loop:
+        - "{{ k3s_pod_cidr }}"
+        - "{{ k3s_service_cidr }}"
 
     - name: Enable ufw
       community.general.ufw:
@@ -154,6 +175,19 @@
   hosts: k3s_server
   become: true
   tasks:
+    # Agents take a little while to register after install, so poll until
+    # every node in the inventory reports Ready.
+    - name: Wait for all nodes to be Ready
+      ansible.builtin.command: k3s kubectl get nodes --no-headers
+      register: node_ready
+      until: >-
+        node_ready.stdout_lines
+        | select('search', ' Ready ')
+        | list | length == groups['k3s_cluster'] | length
+      retries: 30
+      delay: 10
+      changed_when: false
+
     - name: Get node status
       ansible.builtin.command: k3s kubectl get nodes -o wide
       register: node_status
