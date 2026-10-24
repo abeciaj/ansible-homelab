@@ -1,7 +1,7 @@
+# {{ ansible_managed }}
 127.0.0.1 localhost
 ::1 localhost ip6-localhost ip6-loopback
 
-# --- Managed by Ansible: homelab cluster nodes ---
-{% for h in cluster_hosts %}
-{{ h.ip }} {{ h.name }}
+{% for host in groups['k3s_cluster'] %}
+{{ hostvars[host].ansible_host }} {{ host }}
 {% endfor %}

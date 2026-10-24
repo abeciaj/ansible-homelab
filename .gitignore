@@ -1,19 +1,9 @@
-# macOS
 .DS_Store
-
-# Ansible
-*.retry
-.vault_pass*
-vault_password*
-
-# k3s / kube credentials if you ever copy them locally
-kubeconfig*
-*.kubeconfig
-k3s.yaml
-
-# Editor
 .vscode/
+*.retry
 
-# Local environment (real IPs, usernames). Copy from the committed examples.
+# Local settings (real IPs, username)
 inventory.ini
-group_vars/all/local.yml
+
+# ansible-lint collection cache
+.ansible/

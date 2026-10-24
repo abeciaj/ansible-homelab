@@ -1,111 +1,92 @@
 # Homelab bootstrap (Ansible)
 
-Provisions 3x Debian 13 nodes (Dell OptiPlex 7070 Micro) with:
-base updates, common tools, static `/etc/hosts` entries, fail2ban, ufw, and a k3s cluster (1 server + 2 agents).
+Turns 3 Debian 13 nodes (Dell OptiPlex 7070 Micro) into a k3s cluster: OS updates, SSH hardening, fail2ban, ufw, automatic security updates, and k3s (1 server + 2 agents) with embedded etcd and Secrets encrypted at rest.
 
-## 1. Run this from your workstation, not the servers
+## Requirements
 
-Ansible is agentless — install it on your main PC/laptop, and it connects out to the 3 nodes over SSH.
-
-```bash
-# On your workstation
-sudo apt install -y ansible          # Debian/Ubuntu
-brew install ansible                 # macOS
-ansible-galaxy collection install community.general
-```
-
-Windows needs WSL2; Ansible doesn't run natively on Windows.
-
-### What each node needs before Ansible can connect
-
-Ansible can't install the things it uses to connect, so set these up by hand on all 3 nodes (easiest during the Debian installer: tick **SSH server** and **standard system utilities**, and leave the root password blank so your user gets sudo):
-
-- `openssh-server` running
-- `python3` (check with `python3 --version`)
-- A user with **passwordless sudo**. `ansible.cfg` sets `become_ask_pass = False`, so either add `youruser ALL=(ALL) NOPASSWD:ALL` to a file in `/etc/sudoers.d/`, or run the playbook with `-K` to be prompted for the sudo password.
-- A static IP, e.g. a DHCP reservation on your router. The playbook does not assign IPs.
-
-## 2. Set up SSH key access to all 3 nodes first
-
-Ansible needs passwordless SSH (key-based) to work smoothly:
+**Workstation** (where Ansible runs; Linux, macOS, or WSL2 on Windows):
 
 ```bash
-ssh-keygen -t ed25519          # skip if you already have a key
-ssh-copy-id youruser@192.168.1.101
-ssh-copy-id youruser@192.168.1.102
-ssh-copy-id youruser@192.168.1.103
+brew install ansible            # or: sudo apt install -y ansible
+ansible-galaxy collection install -r requirements.yml
 ```
 
-## 3. Create your local config files
+**Each node**, set up by hand (easiest in the Debian installer: tick **SSH server** and **standard system utilities**, and leave the root password blank so your user gets sudo):
 
-Your real IPs and username go in two git-ignored files, so they never end up in the repo:
+- `openssh-server` and `python3`
+- A user with passwordless sudo (or run the playbook with `-K` to be prompted)
+- A static IP, e.g. a DHCP reservation on your router
+
+## Setup
+
+1. Copy your SSH key to each node:
+
+   ```bash
+   ssh-copy-id youruser@<node-ip>   # once per node
+   ```
+
+2. Create your inventory (git-ignored) and fill in the node IPs, `ansible_user` and `lan_subnet`. Every setting lives in this file.
+
+   ```bash
+   cp inventory.example.ini inventory.ini
+   ```
+
+3. Check that all nodes respond, using your SSH **key**. The playbook turns off password logins.
+
+   ```bash
+   ansible k3s_cluster -m ping
+   ```
+
+## Usage
 
 ```bash
-cp inventory.example.ini inventory.ini
+ansible-playbook site.yml                   # everything
+ansible-playbook site.yml --tags base       # OS updates, packages, hostnames, swap, /etc/hosts
+ansible-playbook site.yml --tags security   # SSH hardening, fail2ban, ufw, auto-updates
+ansible-playbook site.yml --tags k3s        # install/upgrade k3s, then verify
+ansible-playbook site.yml --tags verify     # check all nodes are Ready
 ```
 
-- **`inventory.ini`** — replace the 3 IPs with your nodes' real static IPs, and `YOUR_SSH_USER` with the username you SSH in as.
-- **`group_vars/all/local.yml`** — create it with your values. It loads after `group_vars/all/defaults.yml`, so anything here overrides the defaults:
+Run the whole playbook once on new nodes before using tags. It is safe to re-run.
 
-  ```yaml
-  ---
-  # Must match the IPs in inventory.ini (used to build /etc/hosts on every node)
-  cluster_hosts:
-    - { ip: "192.168.0.151", name: "node1" }
-    - { ip: "192.168.0.152", name: "node2" }
-    - { ip: "192.168.0.153", name: "node3" }
+| Play | Tag | What it does |
+|---|---|---|
+| Preflight checks | always | Stops if `inventory.ini` has placeholders, or if this machine is outside the SSH allow range |
+| Base system setup | `base` | One node at a time: drains it if it's in the cluster and updates are pending, upgrades, reboots if needed, uncordons. Installs packages, sets hostnames, disables swap, writes `/etc/hosts` |
+| Security hardening | `security` | Unattended security upgrades, key-only SSH, fail2ban, ufw |
+| Install k3s server | `k3s` | k3s server on node1 at `k3s_version` |
+| Install k3s agents | `k3s` | k3s agents on node2/node3, one at a time, drained on upgrade |
+| Verify cluster | `k3s`, `verify` | Waits until every node is Ready, then lists them |
 
-  # Subnet the nodes are on; k3s ports are only opened to this range
-  lan_subnet: "192.168.0.0/24"
-  ```
-
-## 4. Test connectivity first
-
-```bash
-ansible k3s_cluster -m ping
-```
-
-All 3 should return `SUCCESS`. If not, fix SSH/inventory before continuing.
-
-This must pass using your SSH **key**: the playbook turns off password logins, so if you're still getting in with a password you'll be locked out.
-
-## 5. Run the playbook
-
-```bash
-ansible-playbook site.yml
-```
-
-This runs in order:
-1. **All nodes** — apt update/upgrade, installs curl/git/htop/fail2ban/ufw etc., turns on automatic security updates, hardens SSH, disables swap, writes `/etc/hosts`, configures fail2ban, and enables ufw with default-deny, allowing SSH and the k3s ports from the LAN only.
-2. **node1** — installs the k3s server (control-plane) at the pinned `k3s_version`, grabs the join token.
-3. **node2 & node3** — installs the k3s agent at the same version, joins the cluster using node1's token automatically (no manual copy-paste needed).
-4. **node1** — waits until all 3 nodes report `Ready` (up to 5 minutes), then prints `kubectl get nodes` so you can confirm.
-
-## 6. Use kubectl from your workstation (optional)
-
-`/etc/rancher/k3s/k3s.yaml` on node1 is only readable by root, so fetch it with `sudo` rather than `scp`. This writes to its own file so it doesn't overwrite an existing `~/.kube/config`:
+## kubectl from your workstation
 
 ```bash
 mkdir -p ~/.kube
 ssh youruser@<node1-ip> sudo cat /etc/rancher/k3s/k3s.yaml > ~/.kube/homelab.yaml
-sed -i.bak 's/127.0.0.1/<node1-ip>/' ~/.kube/homelab.yaml   # works on Linux and macOS
+sed -i.bak 's/127.0.0.1/<node1-ip>/' ~/.kube/homelab.yaml
 export KUBECONFIG=~/.kube/homelab.yaml
 kubectl get nodes
 ```
 
-## 7. Upgrading k3s
+## Upgrading k3s
 
-k3s is pinned by `k3s_version` in `group_vars/all/defaults.yml`, so every node (including any you add later) runs the same release. To upgrade, set a newer version from the [k3s releases](https://github.com/k3s-io/k3s/releases) (in `local.yml` or `defaults.yml`) and re-run the playbook. It upgrades node1 first, then the agents. Don't skip minor versions (e.g. go 1.36 → 1.37, not 1.36 → 1.38).
-
-## 8. Re-running
-
-The playbook is idempotent — re-running it won't reinstall k3s or redo completed steps, it'll just confirm everything's still in the desired state. Safe to run anytime you want to push a config change (e.g. editing `cluster_hosts` and re-running updates `/etc/hosts` on all nodes at once).
+Set a newer `k3s_version` in `inventory.ini` and run `ansible-playbook site.yml --tags k3s`. node1 is upgraded first (the API is briefly unavailable), then each agent is drained, upgraded and uncordoned in turn. Upgrade one minor version at a time (1.36 → 1.37, not 1.36 → 1.38).
 
 ## Notes
 
-- **Docker is intentionally excluded** — k3s bundles containerd, so a separate container runtime isn't needed for the cluster itself.
-- **DNS**: this uses `/etc/hosts` for name resolution between the 3 nodes, which is the simplest approach at this scale. If you later add Pi-hole or another DNS server, you can retire this step.
-- **ufw**: default-deny. Allowed: SSH from `ssh_allowed_cidr` (defaults to `lan_subnet`; widen it if you manage the nodes from another subnet, e.g. a VPN); 6443/tcp (API server), 8472/udp (Flannel VXLAN) and 10250/tcp (kubelet) from `lan_subnet`; and all traffic from the k3s pod (`10.42.0.0/16`) and service (`10.43.0.0/16`) networks. If you expose other services directly on a node, add more `ufw` allow rules in `site.yml`.
-- **SSH**: `/etc/ssh/sshd_config.d/10-hardening.conf` allows key-only logins, blocks root, and only lets in the `ansible_user` from your inventory. If you need another account to SSH in, add it there.
-- **Host key checking is on.** `ssh-copy-id` saves each node's host key the first time you connect. If you reinstall a node, Ansible will refuse to connect until you remove the old key: `ssh-keygen -R <node-ip>`, then SSH in once to accept the new one.
-- **Security updates** install automatically every day from Debian's security archive. Nodes are never rebooted automatically; if `/var/run/reboot-required` exists, reboot nodes one at a time (agents first, node1 last).
+- **Firewall**: default deny. SSH is allowed from `lan_subnet` (or `ssh_allowed_cidr`). From `lan_subnet`, it also allows 6443/tcp (API), 8472/udp (Flannel), 10250/tcp (kubelet) and 80/443/tcp (Traefik). It allows all traffic from the pod and service networks.
+- **SSH**: key-only, no root login, and only `ansible_user` may log in.
+- **Host keys**: host key checking is on. After reinstalling a node, run `ssh-keygen -R <node-ip>` and SSH in once to accept the new key.
+- **Updates**: security updates install daily and never reboot. To apply ones that need a reboot, run `--tags base`.
+- **Draining**: the other nodes need room for a drained node's pods. If a drain doesn't finish in 5 minutes, the run stops and leaves the node cordoned. To recover, run `sudo k3s kubectl uncordon <node>` on node1.
+- **Backups**: none. Scheduled etcd snapshots are off until there's storage off node1 (see `templates/k3s_server_config.yaml.j2`). Take one manually with `sudo k3s etcd-snapshot save`.
+- **Before the first install**, decide on `cluster-init` and `secrets-encryption` in `templates/k3s_server_config.yaml.j2`. Changing either later means a data migration or a key rotation.
+- **Adding more servers** (HA) needs ports 2379–2380/tcp opened between them for etcd.
+
+## Linting
+
+CI runs `ansible-playbook --syntax-check` and `ansible-lint` (production profile) on every push. Locally:
+
+```bash
+pip install ansible-lint && ansible-lint
+```

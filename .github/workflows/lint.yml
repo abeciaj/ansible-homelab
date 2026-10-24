@@ -1,0 +1,31 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-lint
+        run: pip install "ansible-lint==26.10.1"
+
+      # inventory.ini is git-ignored, so use the example for the checks.
+      - name: Use example inventory
+        run: cp inventory.example.ini inventory.ini
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Syntax check
+        run: ansible-playbook --syntax-check site.yml
+
+      - name: ansible-lint
+        run: ansible-lint

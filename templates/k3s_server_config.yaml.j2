@@ -1,0 +1,13 @@
+# {{ ansible_managed }}
+
+# Embedded etcd instead of SQLite. Needed to add more servers later.
+# Set before the first install; enabling it later migrates the datastore.
+cluster-init: true
+
+# Encrypt Secrets at rest. Set before the first install; changing it later
+# needs a key rotation.
+secrets-encryption: true
+
+# No off-node storage for snapshots yet. Remove to get k3s's default
+# snapshots (every 12h, keep 5); see also the etcd-s3-* options.
+etcd-disable-snapshots: true

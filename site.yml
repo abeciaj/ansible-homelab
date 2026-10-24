@@ -1,51 +1,159 @@
 ---
-# Homelab bootstrap playbook
-# Run against: Dell OptiPlex 7070 Micro x3, Debian 13
-#
-# Usage:
-#   ansible-playbook site.yml
-#
-# Covers:
-#   1. Base update/upgrade + common tools
-#   2. /etc/hosts static name resolution (homelab-scale "DNS")
-#   3. SSH hardening, fail2ban, ufw, unattended security updates
-#   4. k3s (server on node1, agents on node2/node3), pinned to k3s_version
+# Bootstraps a 3-node k3s cluster on Debian 13. See README.md for usage.
 
-# ---------------------------------------------------------------------------
-# Play 1: runs on ALL nodes
-# ---------------------------------------------------------------------------
-- name: Base system setup (all nodes)
+- name: Preflight checks
+  hosts: k3s_cluster
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Check inventory.ini placeholders are filled in
+      ansible.builtin.assert:
+        that:
+          - ansible_user != 'YOUR_SSH_USER'
+          - lan_subnet is defined
+        fail_msg: Set ansible_user and lan_subnet in inventory.ini first.
+        quiet: true
+
+    # ufw limits SSH to this range, so make sure the machine running Ansible
+    # is inside it, or the run would lock itself out.
+    - name: Check this machine is inside the SSH allow range
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import ipaddress, os, sys
+            client = os.environ.get("SSH_CLIENT", "").split()
+            if not client:
+                sys.exit("SSH_CLIENT not set")
+            print(client[0])
+            sys.exit(ipaddress.ip_address(client[0]) not in ipaddress.ip_network(sys.argv[1], strict=False))
+          - "{{ ssh_allowed_cidr | default(lan_subnet) }}"
+      register: ssh_source
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if SSH would be blocked for this machine
+      ansible.builtin.assert:
+        that: ssh_source.rc == 0
+        fail_msg: >-
+          This machine connects from {{ ssh_source.stdout | default('an unknown address', true) }},
+          which is outside {{ ssh_allowed_cidr | default(lan_subnet) }}. The firewall would
+          lock you out. Fix lan_subnet, or set ssh_allowed_cidr in inventory.ini.
+        quiet: true
+
+# One node at a time, so OS updates never take down more than one node.
+- name: Base system setup
   hosts: k3s_cluster
   become: true
+  serial: 1
+  tags: [base]
+  vars:
+    k3s_server_host: "{{ groups['k3s_server'][0] }}"
   tasks:
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Full upgrade
+    - name: Check for pending upgrades
       ansible.builtin.apt:
         upgrade: dist
+      check_mode: true
+      register: apt_pending
 
-    - name: Install common tools
+    - name: Check whether this node is already in the cluster
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_bin
+
+    # Not a handler: the whole sequence must finish on this node before
+    # serial moves on to the next one.
+    - name: Upgrade packages, draining the node if it's in the cluster  # noqa: no-handler
+      when: apt_pending is changed
+      block:
+        - name: Drain node
+          ansible.builtin.command: >
+            k3s kubectl drain {{ inventory_hostname }}
+            --ignore-daemonsets --delete-emptydir-data --timeout=300s
+          delegate_to: "{{ k3s_server_host }}"
+          when: k3s_bin.stat.exists
+          changed_when: true
+
+        - name: Upgrade all packages
+          ansible.builtin.apt:
+            upgrade: dist
+
+        - name: Check if a reboot is required
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: reboot_required
+
+        - name: Reboot
+          ansible.builtin.reboot:
+            reboot_timeout: 600
+          when: reboot_required.stat.exists
+
+        - name: Wait for node to be Ready
+          ansible.builtin.command: k3s kubectl get node {{ inventory_hostname }} --no-headers
+          register: node_after_upgrade
+          until: "' Ready' in node_after_upgrade.stdout"
+          retries: 30
+          delay: 10
+          changed_when: false
+          delegate_to: "{{ k3s_server_host }}"
+          when: k3s_bin.stat.exists
+
+        - name: Uncordon node
+          ansible.builtin.command: k3s kubectl uncordon {{ inventory_hostname }}
+          delegate_to: "{{ k3s_server_host }}"
+          when: k3s_bin.stat.exists
+          changed_when: true
+
+    - name: Install packages
       ansible.builtin.apt:
         name:
           - curl
-          - wget
-          - vim
           - git
           - htop
-          - net-tools
-          - openssh-server
+          - vim
           - ufw
           - fail2ban
           - unattended-upgrades
         state: present
 
-    # Debian's default unattended-upgrades config only pulls from the
-    # security archive and never reboots on its own, so nodes won't all
-    # restart at once. Reboot them one at a time yourself when needed.
-    - name: Enable daily unattended security upgrades
+    # k3s registers nodes by hostname, so each must be unique.
+    - name: Set hostname from the inventory
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Disable swap
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+      changed_when: true
+
+    - name: Comment out swap in /etc/fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        line: '#\1'
+        backrefs: true
+
+    - name: Write /etc/hosts
+      ansible.builtin.template:
+        src: templates/hosts.j2
+        dest: /etc/hosts
+        owner: root
+        group: root
+        mode: "0644"
+
+- name: Security hardening
+  hosts: k3s_cluster
+  become: true
+  tags: [security]
+  tasks:
+    # Debian's defaults only install from the security archive and never reboot.
+    - name: Enable unattended security upgrades
       ansible.builtin.copy:
         dest: /etc/apt/apt.conf.d/20auto-upgrades
         content: |
@@ -55,9 +163,7 @@
         group: root
         mode: "0644"
 
-    # Key-only SSH, no root login, only the Ansible user. The 10- prefix
-    # makes it load before other drop-ins, and sshd uses the first value it
-    # sees. Validated with sshd -t so a bad config is never written.
+    # sshd keeps the first value it reads, so the 10- prefix wins over other drop-ins.
     - name: Harden sshd
       ansible.builtin.template:
         src: templates/sshd_hardening.conf.j2
@@ -68,27 +174,7 @@
         validate: /usr/sbin/sshd -t -f %s
       notify: Reload sshd
 
-    - name: Disable swap now
-      ansible.builtin.command: swapoff -a
-      when: ansible_swaptotal_mb > 0
-      changed_when: true
-
-    - name: Remove swap entries from /etc/fstab
-      ansible.builtin.lineinfile:
-        path: /etc/fstab
-        regexp: '^([^#].*\sswap\s.*)$'
-        line: '#\1'
-        backrefs: true
-
-    - name: Deploy /etc/hosts with all cluster nodes
-      ansible.builtin.template:
-        src: templates/hosts.j2
-        dest: /etc/hosts
-        owner: root
-        group: root
-        mode: "0644"
-
-    - name: Configure fail2ban jail for sshd
+    - name: Configure fail2ban
       ansible.builtin.template:
         src: templates/jail.local.j2
         dest: /etc/fail2ban/jail.local
@@ -97,28 +183,18 @@
         mode: "0644"
       notify: Restart fail2ban
 
-    - name: Ensure fail2ban is enabled and running
+    - name: Enable fail2ban
       ansible.builtin.systemd:
         name: fail2ban
         enabled: true
         state: started
 
-    - name: Allow SSH through ufw from the LAN only
+    - name: Allow SSH from the LAN
       community.general.ufw:
         rule: allow
         name: OpenSSH
-        src: "{{ ssh_allowed_cidr }}"
+        src: "{{ ssh_allowed_cidr | default(lan_subnet) }}"
 
-    # Older runs of this playbook allowed SSH from anywhere. Removed only
-    # after the LAN rule above exists, so the current session isn't cut off.
-    - name: Remove SSH-from-anywhere rule
-      community.general.ufw:
-        rule: allow
-        name: OpenSSH
-        delete: true
-
-    # k3s needs these open between the nodes, otherwise agents can't join
-    # and pod networking breaks. Must be in place before ufw is enabled.
     - name: Allow k3s node-to-node traffic from the LAN
       community.general.ufw:
         rule: allow
@@ -126,9 +202,24 @@
         port: "{{ item.port }}"
         proto: "{{ item.proto }}"
       loop:
-        - { port: "6443", proto: tcp }    # Kubernetes API server
+        - { port: "6443", proto: tcp }    # Kubernetes API
         - { port: "8472", proto: udp }    # Flannel VXLAN
         - { port: "10250", proto: tcp }   # Kubelet
+
+    # ServiceLB DNATs 80/443 to the Traefik pod, so allow both the INPUT
+    # and the routed (FORWARD) path.
+    - name: Allow HTTP/HTTPS to Traefik from the LAN
+      community.general.ufw:
+        rule: allow
+        src: "{{ lan_subnet }}"
+        port: "{{ item.port }}"
+        proto: tcp
+        route: "{{ item.route }}"
+      loop:
+        - { port: "80", route: false }
+        - { port: "443", route: false }
+        - { port: "80", route: true }
+        - { port: "443", route: true }
 
     - name: Allow k3s pod and service networks
       community.general.ufw:
@@ -138,7 +229,7 @@
         - "{{ k3s_pod_cidr }}"
         - "{{ k3s_service_cidr }}"
 
-    - name: Enable ufw
+    - name: Enable ufw with default deny
       community.general.ufw:
         state: enabled
         policy: deny
@@ -154,12 +245,12 @@
         name: ssh
         state: reloaded
 
-# ---------------------------------------------------------------------------
-# Play 2: k3s server (control-plane) — node1 only
-# ---------------------------------------------------------------------------
+# Not drained on upgrade: with a single control-plane there's nowhere to move
+# it to. Running pods are unaffected; the API is briefly unavailable.
 - name: Install k3s server
   hosts: k3s_server
   become: true
+  tags: [k3s]
   tasks:
     - name: Check installed k3s version
       ansible.builtin.command: k3s --version
@@ -167,16 +258,46 @@
       failed_when: false
       changed_when: false
 
-    # Runs on first install, and again whenever k3s_version is bumped
-    # (re-running the install script is k3s's documented upgrade path).
-    - name: Install or upgrade k3s server to {{ k3s_version }}
-      ansible.builtin.shell: >
-        curl -sfL https://get.k3s.io |
-        INSTALL_K3S_VERSION={{ k3s_version }}
-        sh -
-      when: k3s_current.rc != 0 or k3s_version not in k3s_current.stdout
+    - name: Decide whether to install or upgrade
+      ansible.builtin.set_fact:
+        k3s_server_needs_install: "{{ k3s_current.rc != 0 or k3s_version not in k3s_current.stdout }}"
 
-    - name: Wait for node-token file to exist
+    # Written before the first start so k3s comes up with etcd and Secrets
+    # encryption from day one.
+    - name: Create k3s config directory
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Write k3s server config
+      ansible.builtin.template:
+        src: templates/k3s_server_config.yaml.j2
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart k3s
+
+    # The k3s version is pinned by INSTALL_K3S_VERSION, not by the script.
+    - name: Download k3s install script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /usr/local/share/k3s-install.sh
+        mode: "0700"
+        force: true
+      when: k3s_server_needs_install
+
+    - name: Install or upgrade k3s server to {{ k3s_version }}
+      ansible.builtin.command: /usr/local/share/k3s-install.sh
+      environment:
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+      when: k3s_server_needs_install
+      changed_when: true
+
+    - name: Wait for node token
       ansible.builtin.wait_for:
         path: /var/lib/rancher/k3s/server/node-token
         timeout: 60
@@ -184,21 +305,24 @@
     - name: Read node token
       ansible.builtin.slurp:
         src: /var/lib/rancher/k3s/server/node-token
-      register: node_token_raw
+      register: node_token
 
-    - name: Store node token as a fact for agents to use
-      ansible.builtin.set_fact:
-        k3s_node_token: "{{ node_token_raw.content | b64decode | trim }}"
+  handlers:
+    # On first install the install script has already started k3s with this config.
+    - name: Restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+      when: k3s_current.rc == 0
 
-# ---------------------------------------------------------------------------
-# Play 3: k3s agents (workers) — node2, node3
-# ---------------------------------------------------------------------------
+# One agent at a time; on upgrade each is drained first.
 - name: Install k3s agents
   hosts: k3s_agents
   become: true
+  serial: 1
+  tags: [k3s]
   vars:
-    k3s_server_ip: "{{ hostvars[groups['k3s_server'][0]].ansible_host }}"
-    k3s_token: "{{ hostvars[groups['k3s_server'][0]].k3s_node_token }}"
+    k3s_server_host: "{{ groups['k3s_server'][0] }}"
   tasks:
     - name: Check installed k3s version
       ansible.builtin.command: k3s --version
@@ -206,42 +330,68 @@
       failed_when: false
       changed_when: false
 
-    - name: Install or upgrade k3s agent to {{ k3s_version }}
-      ansible.builtin.shell: >
-        curl -sfL https://get.k3s.io |
-        INSTALL_K3S_VERSION={{ k3s_version }}
-        K3S_URL=https://{{ k3s_server_ip }}:6443
-        K3S_TOKEN={{ k3s_token }}
-        sh -
-      when: k3s_agent_current.rc != 0 or k3s_version not in k3s_agent_current.stdout
-      # The command line contains the cluster join token; keep it out of output and logs.
-      no_log: true
+    - name: Decide whether to install or upgrade
+      ansible.builtin.set_fact:
+        k3s_agent_upgrading: "{{ k3s_agent_current.rc == 0 and k3s_version not in k3s_agent_current.stdout }}"
 
-# ---------------------------------------------------------------------------
-# Play 4: sanity check from the control-plane
-# ---------------------------------------------------------------------------
+    - name: Drain agent
+      ansible.builtin.command: >
+        k3s kubectl drain {{ inventory_hostname }}
+        --ignore-daemonsets --delete-emptydir-data --timeout=300s
+      delegate_to: "{{ k3s_server_host }}"
+      when: k3s_agent_upgrading
+      changed_when: true
+
+    - name: Download k3s install script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /usr/local/share/k3s-install.sh
+        mode: "0700"
+        force: true
+      when: k3s_agent_current.rc != 0 or k3s_agent_upgrading
+
+    - name: Install or upgrade k3s agent to {{ k3s_version }}
+      ansible.builtin.command: /usr/local/share/k3s-install.sh
+      environment:
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+        K3S_URL: "https://{{ hostvars[k3s_server_host].ansible_host }}:6443"
+        K3S_TOKEN: "{{ hostvars[k3s_server_host].node_token.content | b64decode | trim }}"
+      when: k3s_agent_current.rc != 0 or k3s_agent_upgrading
+      changed_when: true
+      no_log: true  # K3S_TOKEN is the cluster join secret
+
+    - name: Wait for agent to be Ready on the new version
+      ansible.builtin.command: k3s kubectl get node {{ inventory_hostname }} --no-headers
+      register: agent_after_upgrade
+      until: "' Ready' in agent_after_upgrade.stdout and k3s_version in agent_after_upgrade.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+      delegate_to: "{{ k3s_server_host }}"
+      when: k3s_agent_upgrading
+
+    - name: Uncordon agent
+      ansible.builtin.command: k3s kubectl uncordon {{ inventory_hostname }}
+      delegate_to: "{{ k3s_server_host }}"
+      when: k3s_agent_upgrading
+      changed_when: true
+
 - name: Verify cluster
   hosts: k3s_server
   become: true
+  tags: [k3s, verify]
   tasks:
-    # Agents take a little while to register after install, so poll until
-    # every node in the inventory reports Ready.
     - name: Wait for all nodes to be Ready
-      ansible.builtin.command: k3s kubectl get nodes --no-headers
-      register: node_ready
+      ansible.builtin.command: k3s kubectl get nodes -o wide
+      register: nodes
       until: >-
-        node_ready.stdout_lines
+        nodes.stdout_lines
         | select('search', ' Ready ')
         | list | length == groups['k3s_cluster'] | length
       retries: 30
       delay: 10
       changed_when: false
 
-    - name: Get node status
-      ansible.builtin.command: k3s kubectl get nodes -o wide
-      register: node_status
-      changed_when: false
-
     - name: Show cluster nodes
       ansible.builtin.debug:
-        msg: "{{ node_status.stdout_lines }}"
+        msg: "{{ nodes.stdout_lines }}"

@@ -1,0 +1,6 @@
+---
+# Same settings locally and in CI: `ansible-lint` from the repo root.
+profile: production
+exclude_paths:
+  - .ansible/
+  - .github/
