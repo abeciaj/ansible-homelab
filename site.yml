@@ -229,10 +229,8 @@
         - "{{ k3s_pod_cidr }}"
         - "{{ k3s_service_cidr }}"
 
-    # node-exporter (Part 3's monitoring) listens on each node's own IP. Prometheus
-    # traffic from another node arrives from that node's LAN address, because Flannel
-    # masquerades pod-to-node traffic, so the pod network rule above doesn't cover it.
-    # Only the nodes are allowed, so host metrics stay hidden from the rest of the LAN.
+    # Flannel masquerades pod-to-node traffic, so Prometheus scrapes of node-exporter
+    # arrive from a node's LAN IP, not the pod network. Nodes only, not the whole LAN.
     - name: Allow node-exporter scrapes from the cluster nodes
       community.general.ufw:
         rule: allow
