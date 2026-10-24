@@ -229,6 +229,18 @@
         - "{{ k3s_pod_cidr }}"
         - "{{ k3s_service_cidr }}"
 
+    # node-exporter (Part 3's monitoring) listens on each node's own IP. Prometheus
+    # traffic from another node arrives from that node's LAN address, because Flannel
+    # masquerades pod-to-node traffic, so the pod network rule above doesn't cover it.
+    # Only the nodes are allowed, so host metrics stay hidden from the rest of the LAN.
+    - name: Allow node-exporter scrapes from the cluster nodes
+      community.general.ufw:
+        rule: allow
+        src: "{{ hostvars[item].ansible_host }}"
+        port: "9100"
+        proto: tcp
+      loop: "{{ groups['k3s_cluster'] }}"
+
     - name: Enable ufw with default deny
       community.general.ufw:
         state: enabled
@@ -306,6 +318,7 @@
       ansible.builtin.slurp:
         src: /var/lib/rancher/k3s/server/node-token
       register: node_token
+      no_log: true  # cluster join secret
 
   handlers:
     # On first install the install script has already started k3s with this config.
@@ -380,6 +393,8 @@
   hosts: k3s_server
   become: true
   tags: [k3s, verify]
+  vars:
+    kubeconfig_path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.kube/homelab.yaml"
   tasks:
     - name: Wait for all nodes to be Ready
       ansible.builtin.command: k3s kubectl get nodes -o wide
@@ -395,3 +410,31 @@
     - name: Show cluster nodes
       ansible.builtin.debug:
         msg: "{{ nodes.stdout_lines }}"
+
+    # k3s.yaml is root-only and points at 127.0.0.1. Read it with become and save a
+    # copy pointing at node1, in its own file so an existing ~/.kube/config is untouched.
+    - name: Read admin kubeconfig
+      ansible.builtin.slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: k3s_kubeconfig
+      no_log: true  # contains the cluster-admin key
+      tags: [kubeconfig]
+
+    - name: Create ~/.kube on this workstation
+      ansible.builtin.file:
+        path: "{{ kubeconfig_path | dirname }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+      tags: [kubeconfig]
+
+    - name: Save kubeconfig to this workstation
+      ansible.builtin.copy:
+        content: "{{ k3s_kubeconfig.content | b64decode | replace('https://127.0.0.1:', 'https://' ~ ansible_host ~ ':') }}"
+        dest: "{{ kubeconfig_path }}"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      no_log: true  # contains the cluster-admin key
+      tags: [kubeconfig]

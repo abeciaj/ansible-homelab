@@ -56,17 +56,18 @@ Run the whole playbook once on new nodes before using tags. It is safe to re-run
 | Security hardening | `security` | Unattended security upgrades, key-only SSH, fail2ban, ufw |
 | Install k3s server | `k3s` | k3s server on node1 at `k3s_version` |
 | Install k3s agents | `k3s` | k3s agents on node2/node3, one at a time, drained on upgrade |
-| Verify cluster | `k3s`, `verify` | Waits until every node is Ready, then lists them |
+| Verify cluster | `k3s`, `verify` | Waits until every node is Ready, lists them, and saves the kubeconfig to `~/.kube/homelab.yaml` |
 
 ## kubectl from your workstation
 
+The Verify play saves the cluster's kubeconfig to `~/.kube/homelab.yaml` (mode 600), pointed at node1. It goes in its own file, so an existing `~/.kube/config` is left alone. To fetch it again without re-running the rest: `ansible-playbook site.yml --tags kubeconfig`.
+
 ```bash
-mkdir -p ~/.kube
-ssh youruser@<node1-ip> sudo cat /etc/rancher/k3s/k3s.yaml > ~/.kube/homelab.yaml
-sed -i.bak 's/127.0.0.1/<node1-ip>/' ~/.kube/homelab.yaml
 export KUBECONFIG=~/.kube/homelab.yaml
 kubectl get nodes
 ```
+
+The file holds a cluster-admin certificate. Never commit it.
 
 ## Upgrading k3s
 
@@ -74,7 +75,7 @@ Set a newer `k3s_version` in `inventory.ini` and run `ansible-playbook site.yml 
 
 ## Notes
 
-- **Firewall**: default deny. SSH is allowed from `lan_subnet` (or `ssh_allowed_cidr`). From `lan_subnet`, it also allows 6443/tcp (API), 8472/udp (Flannel), 10250/tcp (kubelet) and 80/443/tcp (Traefik). It allows all traffic from the pod and service networks.
+- **Firewall**: default deny. SSH is allowed from `lan_subnet` (or `ssh_allowed_cidr`). From `lan_subnet`, it also allows 6443/tcp (API), 8472/udp (Flannel), 10250/tcp (kubelet) and 80/443/tcp (Traefik). It allows all traffic from the pod and service networks, and 9100/tcp (node-exporter, for monitoring) from the cluster nodes only.
 - **SSH**: key-only, no root login, and only `ansible_user` may log in.
 - **Host keys**: host key checking is on. After reinstalling a node, run `ssh-keygen -R <node-ip>` and SSH in once to accept the new key.
 - **Updates**: security updates install daily and never reboot. To apply ones that need a reboot, run `--tags base`.
