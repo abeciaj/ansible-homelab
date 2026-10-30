@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+# Cluster-wide Pod Security defaults, for every namespace without its own
+# pod-security.kubernetes.io labels. Baseline blocks privileged containers,
+# host namespaces and hostPath; restricted is only warned about and audited.
+# A namespace that needs more (node-exporter, the CI runner) sets its own labels.
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: PodSecurity
+    configuration:
+      apiVersion: pod-security.admission.config.k8s.io/v1
+      kind: PodSecurityConfiguration
+      defaults:
+        enforce: baseline
+        enforce-version: latest
+        audit: restricted
+        audit-version: latest
+        warn: restricted
+        warn-version: latest
+      exemptions:
+        usernames: []
+        runtimeClasses: []
+        # k3s's own components: ServiceLB, the Helm install jobs and the
+        # local-path helper pods need host access.
+        namespaces: [kube-system]

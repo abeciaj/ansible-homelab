@@ -122,6 +122,16 @@
           - unattended-upgrades
         state: present
 
+    # node-exporter (k8s-homelab's monitoring stack) reads metrics files from here,
+    # and reports a scrape error if it's missing. The audit play writes into it.
+    - name: Create the node-exporter textfile directory
+      ansible.builtin.file:
+        path: /var/lib/node_exporter/textfile_collector
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
     # k3s registers nodes by hostname, so each must be unique.
     - name: Set hostname from the inventory
       ansible.builtin.hostname:
@@ -173,6 +183,50 @@
         mode: "0644"
         validate: /usr/sbin/sshd -t -f %s
       notify: Reload sshd
+
+    # Before the k3s plays: protect-kernel-defaults makes the kubelet refuse to
+    # start if these aren't already in effect.
+    - name: Write kernel hardening settings
+      ansible.builtin.template:
+        src: templates/sysctl_hardening.conf.j2
+        dest: /etc/sysctl.d/90-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+      register: sysctl_conf
+
+    - name: Apply kernel settings now  # noqa: no-handler
+      ansible.builtin.command: sysctl --system
+      when: sysctl_conf is changed
+      changed_when: true
+
+    - name: Block unused network protocols and USB/FireWire storage
+      ansible.builtin.template:
+        src: templates/modprobe_hardening.conf.j2
+        dest: /etc/modprobe.d/90-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+
+    # Gives each login session its own temp directory (Lynis DEB-0280).
+    - name: Install libpam-tmpdir
+      ansible.builtin.apt:
+        name: libpam-tmpdir
+        state: present
+
+    # Only root needs to read these (Lynis FILE-7524).
+    - name: Restrict cron and sshd config permissions
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /etc/crontab, mode: "0600" }
+        - { path: /etc/ssh/sshd_config, mode: "0600" }
+        - { path: /etc/cron.d, mode: "0700" }
+        - { path: /etc/cron.daily, mode: "0700" }
+        - { path: /etc/cron.hourly, mode: "0700" }
+        - { path: /etc/cron.weekly, mode: "0700" }
+        - { path: /etc/cron.monthly, mode: "0700" }
 
     - name: Configure fail2ban
       ansible.builtin.template:
@@ -282,6 +336,27 @@
         group: root
         mode: "0755"
 
+    - name: Create k3s audit log directory
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/server/logs
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    # Referenced from config.yaml, so they must exist before k3s (re)starts.
+    - name: Write API audit policy and Pod Security defaults
+      ansible.builtin.template:
+        src: "templates/{{ item.src }}"
+        dest: "/var/lib/rancher/k3s/server/{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop:
+        - { src: k3s_audit_policy.yaml.j2, dest: audit-policy.yaml }
+        - { src: k3s_pod_security.yaml.j2, dest: pod-security.yaml }
+      notify: Restart k3s
+
     - name: Write k3s server config
       ansible.builtin.template:
         src: templates/k3s_server_config.yaml.j2
@@ -353,6 +428,23 @@
       when: k3s_agent_upgrading
       changed_when: true
 
+    - name: Create k3s config directory
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Write k3s agent config
+      ansible.builtin.template:
+        src: templates/k3s_agent_config.yaml.j2
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart k3s-agent
+
     - name: Download k3s install script
       ansible.builtin.get_url:
         url: https://get.k3s.io
@@ -386,6 +478,15 @@
       delegate_to: "{{ k3s_server_host }}"
       when: k3s_agent_upgrading
       changed_when: true
+
+  handlers:
+    # Restarting the agent restarts the kubelet, not the pods. On first install the
+    # install script has already started it with this config.
+    - name: Restart k3s-agent
+      ansible.builtin.systemd:
+        name: k3s-agent
+        state: restarted
+      when: k3s_agent_current.rc == 0
 
 - name: Verify cluster
   hosts: k3s_server
@@ -436,3 +537,115 @@
       become: false
       no_log: true  # contains the cluster-admin key
       tags: [kubeconfig]
+
+# On demand only ("never"): ansible-playbook site.yml --tags audit
+# Lynis audits each node's hardening; debsecan lists installed packages with known
+# vulnerabilities that already have a fix. Reports are saved to this workstation,
+# and the counts go to node-exporter's textfile collector for Grafana.
+- name: Security audit
+  hosts: k3s_cluster
+  become: true
+  tags: [audit, never]
+  vars:
+    audit_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/homelab-audit/{{ now(fmt='%Y-%m-%d') }}"
+    # Must match --collector.textfile.directory in k8s-homelab's monitoring/values.yaml.
+    textfile_dir: /var/lib/node_exporter/textfile_collector
+    lynis_score: >-
+      {{ (lynis_summary.stdout_lines | select('match', '^hardening_index=') | first
+          | default('hardening_index=NaN')).split('=')[1] }}
+    lynis_warnings: "{{ lynis_summary.stdout_lines | select('match', '^warning') | list | length }}"
+    lynis_suggestions: "{{ lynis_summary.stdout_lines | select('match', '^suggestion') | list | length }}"
+    fixable_cves: "{{ debsecan.stdout_lines | length }}"
+  tasks:
+    - name: Install Lynis and debsecan
+      ansible.builtin.apt:
+        name:
+          - lynis
+          - debsecan
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Run Lynis
+      ansible.builtin.command: lynis audit system --quick --no-colors
+      register: lynis
+      changed_when: false
+
+    - name: Read the Lynis score, warnings and suggestions
+      ansible.builtin.command: grep -E '^(hardening_index|warning\[\]|suggestion\[\])=' /var/log/lynis-report.dat
+      register: lynis_summary
+      changed_when: false
+      failed_when: lynis_summary.rc > 1
+
+    # Only CVEs with a fixed package available: the ones an upgrade resolves.
+    - name: Run debsecan
+      ansible.builtin.command: debsecan --suite {{ ansible_distribution_release }} --only-fixed
+      register: debsecan
+      changed_when: false
+
+    - name: Create the node-exporter textfile directory
+      ansible.builtin.file:
+        path: "{{ textfile_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # node-exporter reads every *.prom file in the directory, so write under another
+    # name and rename: it never sees a half-written file.
+    - name: Write audit metrics for node-exporter
+      ansible.builtin.copy:
+        dest: "{{ textfile_dir }}/audit.prom.tmp"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # HELP lynis_hardening_index Lynis hardening index (0-100) from the last audit.
+          # TYPE lynis_hardening_index gauge
+          lynis_hardening_index {{ lynis_score }}
+          # HELP lynis_warnings Lynis warnings from the last audit.
+          # TYPE lynis_warnings gauge
+          lynis_warnings {{ lynis_warnings }}
+          # HELP lynis_suggestions Lynis suggestions from the last audit.
+          # TYPE lynis_suggestions gauge
+          lynis_suggestions {{ lynis_suggestions }}
+          # HELP debsecan_fixable_vulnerabilities Installed package CVEs with a fix available in Debian.
+          # TYPE debsecan_fixable_vulnerabilities gauge
+          debsecan_fixable_vulnerabilities {{ fixable_cves }}
+          # HELP homelab_audit_last_run_timestamp_seconds When the audit last ran on this node.
+          # TYPE homelab_audit_last_run_timestamp_seconds gauge
+          homelab_audit_last_run_timestamp_seconds {{ ansible_facts['date_time']['epoch'] }}
+
+    - name: Publish audit metrics
+      ansible.builtin.command: mv {{ textfile_dir }}/audit.prom.tmp {{ textfile_dir }}/audit.prom
+      changed_when: true
+
+    - name: Create the report folder on this workstation
+      ansible.builtin.file:
+        path: "{{ audit_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Save reports to this workstation
+      ansible.builtin.copy:
+        content: "{{ item.content }}\n"
+        dest: "{{ audit_dir }}/{{ inventory_hostname }}-{{ item.name }}.txt"
+        mode: "0600"
+      loop:
+        - { name: lynis, content: "{{ lynis.stdout }}" }
+        - { name: debsecan, content: "{{ debsecan.stdout or 'No installed packages have CVEs with a fix available.' }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Show summary
+      ansible.builtin.debug:
+        msg:
+          - "Lynis hardening index: {{ lynis_score }}"
+          - "Lynis warnings: {{ lynis_warnings }}, suggestions: {{ lynis_suggestions }}"
+          - "Fixable CVEs: {{ fixable_cves }}"
+          - "Reports: {{ audit_dir }}"

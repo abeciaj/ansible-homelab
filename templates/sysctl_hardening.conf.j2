@@ -1,0 +1,40 @@
+# {{ ansible_managed }}
+# A leading "-" skips a key this kernel doesn't have (no Yama, IPv6 off) instead
+# of failing the whole file.
+
+# Required by protect-kernel-defaults in the k3s config: the kubelet refuses to
+# start unless all six are already set, instead of changing them itself. The list
+# is setupKernelTunables in the kubelet's source; check it when upgrading k3s.
+vm.panic_on_oom = 0
+vm.overcommit_memory = 1
+kernel.panic = 10
+kernel.panic_on_oops = 1
+kernel.keys.root_maxkeys = 1000000
+kernel.keys.root_maxbytes = 25000000
+
+# Kernel hardening (Lynis KRNL-6000). Left out on purpose, because Kubernetes
+# needs them: net.ipv4.ip_forward (pod routing), kernel.modules_disabled (k3s
+# loads modules at runtime) and strict rp_filter (breaks Flannel traffic).
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.sysrq = 0
+-kernel.yama.ptrace_scope = 1
+-kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
+dev.tty.ldisc_autoload = 0
+fs.protected_fifos = 2
+fs.protected_regular = 2
+fs.protected_symlinks = 1
+fs.protected_hardlinks = 1
+fs.suid_dumpable = 0
+
+# The nodes aren't routers for the LAN: ignore and don't send ICMP redirects,
+# and refuse source-routed packets.
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+-net.ipv6.conf.all.accept_redirects = 0
+-net.ipv6.conf.default.accept_redirects = 0

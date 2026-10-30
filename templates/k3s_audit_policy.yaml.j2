@@ -1,0 +1,33 @@
+# {{ ansible_managed }}
+# Kubernetes API audit policy: who did what, when. Request bodies aren't logged
+# (Metadata level), so Secret values never end up in the log.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - RequestReceived
+rules:
+  # Health checks and the constant lease renewals and events would drown out
+  # everything else.
+  - level: None
+    nonResourceURLs:
+      - /healthz*
+      - /livez*
+      - /readyz*
+      - /version
+  - level: None
+    resources:
+      - group: coordination.k8s.io
+        resources: [leases]
+      - group: ""
+        resources: [events]
+  # Reads by nodes and the control plane itself.
+  - level: None
+    verbs: [get, list, watch]
+    userGroups: ["system:nodes"]
+  - level: None
+    verbs: [get, list, watch]
+    users:
+      - "system:apiserver"
+      - "system:kube-controller-manager"
+      - "system:kube-scheduler"
+  - level: Metadata
