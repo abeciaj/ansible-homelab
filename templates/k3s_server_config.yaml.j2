@@ -11,3 +11,18 @@ secrets-encryption: true
 # No off-node storage for snapshots yet. Remove to get k3s's default
 # snapshots (every 12h, keep 5); see also the etcd-s3-* options.
 etcd-disable-snapshots: true
+
+# The kubelet checks the kernel settings it needs instead of changing them
+# (CIS 4.2.6). The security play sets them first, in /etc/sysctl.d.
+protect-kernel-defaults: true
+
+kube-apiserver-arg:
+  # Who did what in the cluster (CIS 1.2.19-1.2.22, 3.2.1). Policy in
+  # audit-policy.yaml; at most 10 files of 100MB, kept for 30 days.
+  - audit-policy-file=/var/lib/rancher/k3s/server/audit-policy.yaml
+  - audit-log-path=/var/lib/rancher/k3s/server/logs/audit.log
+  - audit-log-maxage=30
+  - audit-log-maxbackup=10
+  - audit-log-maxsize=100
+  # Pod Security defaults for namespaces without their own labels.
+  - admission-control-config-file=/var/lib/rancher/k3s/server/pod-security.yaml

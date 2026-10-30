@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+
+# Network protocols nothing here uses (Lynis NETW-3200). Kubernetes doesn't use
+# SCTP unless a Service asks for it.
+install dccp /bin/false
+install sctp /bin/false
+install rds /bin/false
+install tipc /bin/false
+
+# Headless servers: no USB or FireWire storage (Lynis USB-1000, STRG-1846).
+# Takes effect for drivers not already loaded, so after a reboot at the latest.
+install usb-storage /bin/false
+install firewire-core /bin/false
+install firewire-ohci /bin/false

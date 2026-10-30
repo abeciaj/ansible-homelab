@@ -1,0 +1,6 @@
+# {{ ansible_managed }}
+# Read by k3s-agent alongside the server URL and token from the install script.
+
+# The kubelet checks the kernel settings it needs instead of changing them
+# (CIS 4.2.6). The security play sets them first, in /etc/sysctl.d.
+protect-kernel-defaults: true
